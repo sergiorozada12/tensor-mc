@@ -12,11 +12,9 @@ def rgb_to_greenblind(clr):
     new_clr[2] = (4211 + .95724*clr[2]**2.2 + 0.02138*clr[1]**2.2 - 0.02138*clr[0]**2.2)**(1/2.2)
     return new_clr/255
 
-def interp_colors(clr_base,clr_min,clr_max,num_total:int=5):
-    clrs = [clr_min]
-    clrs1 = list((clr_min[None] + (clr_base-clr_min)[None]*np.linspace(0,1,int(num_total/2)+1)[1:-1][:,None]))
-    clrs2 = list((clr_base[None] + (clr_max-clr_base)[None]*np.linspace(0,1,int(num_total/2)+1)[1:-1][:,None]))
-    clrs = [clr_min] + clrs1 + [clr_base] + clrs2 + [clr_max]
+def interp_colors(clr_min,clr_max,num_total:int=5):
+    alph = np.linspace(0,1,num_total)[1:-1]
+    clrs = [clr_min] + list(clr_min[None]*(1-alph[:,None]) + clr_max[None]*alph[:,None]) + [clr_max]
     return clrs
 
 def madimshow(mat,cmap:str=madcmap,xlabel:str='',ylabel:str='',axis=True,figsize=(4,4),vmin=None,vmax=None):
