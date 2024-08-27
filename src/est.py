@@ -18,21 +18,53 @@ def sin_err(Ph,P,K:int=None,sv_type:str='both'):
     assert sv_type in ['both','left','right'], "Invalid SV type."
     if K is None:
         K,K = P.shape
-    U,_,V = svds(P.numpy().astype(float),K)
-    Uh,_,Vh = svds(Ph.numpy().astype(float),K)
-    if sv_type=='right':
-        return np.sqrt( K - np.linalg.norm(Vh@V.T,'fro')**2 ) / np.sqrt(K)
-    elif sv_type=='left':
-        return np.sqrt( K - np.linalg.norm(Uh.T@U,'fro')**2 ) / np.sqrt(K)
+    if K<P.shape[0]:
+        U,_,V = svds(P.numpy().astype(float),K)
+        Uh,_,Vh = svds(Ph.numpy().astype(float),K)
     else:
-        return torch.tensor([ np.sqrt( K - np.linalg.norm(Uh.T@U,'fro')**2 ), np.sqrt( K - np.linalg.norm(Vh@V.T,'fro')**2 ) ]).to(torch.float).max().item() / np.sqrt(K)
+        U,_,VT = np.linalg.svd(P.numpy().astype(float))
+        V = VT.T
+        Uh,_,VhT = np.linalg.svd(Ph.numpy().astype(float))
+        Vh = VhT.T
+    if sv_type=='right':
+        return float(np.sqrt( np.abs(K - np.linalg.norm(Vh@V.T,'fro')**2) ) / np.sqrt(K))
+    elif sv_type=='left':
+        return float(np.sqrt( np.abs(K - np.linalg.norm(Uh.T@U,'fro')**2) ) / np.sqrt(K))
+    else:
+        return float(torch.tensor([ np.sqrt( np.abs(K - np.linalg.norm(Uh.T@U,'fro')**2) ), np.sqrt( np.abs(K - np.linalg.norm(Vh@V.T,'fro')**2) ) ]).to(torch.float).max().item() / np.sqrt(K))
 
 def erank(A):
     svs = torch.linalg.svdvals(A)
     p = svs / (torch.linalg.norm(svs,1) + int(svs.abs().max()==0))
     return torch.exp(-torch.sum(p * torch.log(p)))
     
+def mat2lowtri(A,N=None):
+    N=A.shape[0]
+    low_tri_indices=np.triu_indices(N,1)
+    return A[low_tri_indices[1],low_tri_indices[0]]
+
+def lowtri2mat(a):
+    N=int((2*len(a)+.25)**.5+.5)
+    A=np.zeros((N,N)) if type(a)!=torch.Tensor else torch.zeros((N,N))
+    low_tri_indices=np.triu_indices(N,1)
+    A[low_tri_indices[1],low_tri_indices[0]]=a
+    A=A+A.T
+    return A
+
 # ------------------------------------------------------------------------
+
+def generate_erdosrenyi_matrix_model(N,edge_prob:float=.3,eps:float=.02,beta:float=1.):
+    A = lowtri2mat(np.random.binomial(1,edge_prob,int(N*(N-1)/2)))
+    L = np.diag(A.sum(0)) - A
+    while np.sum(np.abs(np.linalg.eigvalsh(L))<1e-9)>1:
+        A = lowtri2mat(np.random.binomial(1,edge_prob,int(N*(N-1)/2)))
+        L = np.diag(A.sum(0)) - A
+    At = A + beta * np.eye(N)
+    P0 = At * (1-eps) + eps
+    P = torch.tensor(P0 / P0.sum(1,keepdims=True)).to(torch.float)
+    mc = MarkovChainMatrix(P)
+
+    return mc
 
 def generate_lowranktensor_model(N,K:int):
     D = len(N)
@@ -90,8 +122,8 @@ def estimate_empirical_matrix(X,N:int):
 
     total_counts = transition_counts.sum(1,keepdim=True)
     Ph = transition_counts.float() / total_counts
-    mask = (total_counts==0).expand_as(Ph)
-    Ph[mask] = 1/N
+    Mask = (total_counts==0).expand_as(Ph)
+    Ph[Mask] = 1/N
 
     marginal_counts = transition_counts.sum(1)
     marginal_probs = marginal_counts.float() / marginal_counts.sum()
@@ -100,7 +132,7 @@ def estimate_empirical_matrix(X,N:int):
     total_transitions = marginal_counts.sum()
     Qh = transition_counts.float() / total_transitions
 
-    return Ph, Qh
+    return Ph, Qh, Mask
 
 def estimate_empirical_tensor(X,N):
     Ntot = N.prod().item()
@@ -113,8 +145,8 @@ def estimate_empirical_tensor(X,N):
 
     total_counts = transition_counts.sum(tuple(range(D,2*D)),keepdim=True)
     Ph = transition_counts.float() / total_counts
-    mask = (total_counts==0).expand_as(Ph)
-    Ph[mask] = 1/Ntot
+    Mask = (total_counts==0).expand_as(Ph)
+    Ph[Mask] = 1/Ntot
 
     marginal_counts = transition_counts.sum(tuple(range(D,2*D)))
     marginal_probs = marginal_counts.float() / marginal_counts.sum()
@@ -123,7 +155,7 @@ def estimate_empirical_tensor(X,N):
     total_transitions = marginal_counts.sum()
     Qh = transition_counts.float() / total_transitions
 
-    return Ph, Qh
+    return Ph, Qh, Mask
 
 # ------------------------------------------------------------------------
 
@@ -138,15 +170,18 @@ class LowRankTensorEstimator:
         for a in ['Qh','K','beta','eps_abs','eps_rel','eps_diff','max_itr','verbose','MARG_CONST','ACCEL']:
             setattr(self,a,None)
 
-    def estimate(self, Q_obs, args):
+    # def estimate(self, Q_obs, args):
+    def estimate(self, Q_obs, Mask, args):
         self.reset()
 
         D = Q_obs.ndim // 2
         N = torch.tensor(Q_obs.shape[:D])
         Ntot = torch.prod(N).item()
+        # args['Mask'] = Mask
 
         # Estimate low-rank joint PMF tensor
         Q_LRT, (lmbda, Qfact), err_LRT, (rp_LRT, rd_LRT, ep_LRT, ed_LRT), var_diff = admm_lrt_from_jointpmf(Q_obs,**args)
+        # Q_LRT, (lmbda, Qfact), err_LRT, (rp_LRT, rd_LRT, ep_LRT, ed_LRT), var_diff = admm_lrt_from_jointpmf_mask(Q_obs,**args)
 
         assert not torch.isnan(Q_LRT).any(), "Nan values in estimated Q."
         assert not torch.isinf(Q_LRT).any(), "Inf. values in estimated Q."
@@ -416,7 +451,7 @@ class SpecLowRankMatrixEstimator:
         for a in ['mc','P','Q','pi','K','Qh']:
             setattr(self,a,None)
 
-    def estimate(self, Q_obs, K):
+    def estimate(self, Q_obs, K, prob_min:float=0.):
         assert Q_obs.ndim==2 and Q_obs.shape[0]==Q_obs.shape[1], "Invalid size of input matrix."
         self.reset()
 
@@ -424,7 +459,8 @@ class SpecLowRankMatrixEstimator:
 
         # Estimate low-rank conditional PMF matrix
         UK,svK,VhK = svds(Q_obs.numpy().astype(float),k=K)
-        Q_LRM = torch.maximum( torch.FloatTensor(UK @ np.diag(svK) @ VhK),torch.zeros_like(Q_obs) )
+        # Q_LRM = torch.maximum( torch.FloatTensor(UK @ np.diag(svK) @ VhK),torch.zeros_like(Q_obs) )
+        Q_LRM = torch.maximum( torch.FloatTensor(UK @ np.diag(svK) @ VhK),prob_min*torch.ones_like(Q_obs) )
         Q_LRM = Q_LRM / torch.linalg.norm(Q_LRM,1)
 
         marg_slrm = Q_LRM.sum(dim=1,keepdim=True)
